@@ -1,0 +1,46 @@
+{
+  "domain": "多传感器融合导航",
+  "title": "多传感器融合导航每日简报",
+  "news_focus": "自动驾驶行业、智驾公司、量产与政策，可含少量传感器融合技术",
+  "arxiv_keywords": [
+    ["sensor fusion", "localization"],
+    ["sensor fusion", "navigation"],
+    ["sensor fusion", "SLAM"],
+    ["LiDAR-IMU"],
+    ["visual-inertial"],
+    ["GNSS/INS"],
+    ["multi-modal fusion"],
+    ["multi-sensor", "SLAM"],
+    ["radar", "camera", "fusion"]
+  ],
+  "paper_must_include_any": [
+    "localization", "navigation", "slam", "odometry", "mapping",
+    "visual-inertial", "vio", "lidar-imu", "gnss", " ins "
+  ],
+  "paper_also_include_any": [
+    "fusion", "multi-modal", "multimodal", "multi-sensor", "multisensor",
+    "visual-inertial", "lidar-imu", "gnss/ins",
+    "lidar", "imu", "radar", "camera", "gnss", "sensor"
+  ],
+  "paper_exclude": [
+    "action recognition", "action localization", "temporal localization",
+    "person re-identification", "image inpainting", "sketch",
+    "nanophotonic", "color router", "inverse design",
+    "histopath", "medical imaging"
+  ],
+  "news_queries": [
+    "自动驾驶 行业",
+    "智能驾驶 量产",
+    "Robotaxi 自动驾驶",
+    "autonomous driving industry"
+  ],
+  "weixin_query_groups": {
+    "industry": ["自动驾驶", "智能驾驶", "Robotaxi", "智驾 量产", "高阶智驾"],
+    "company": ["华为智驾", "特斯拉 FSD", "小鹏 智驾", "理想 智驾", "蔚来 智驾", "百度 Apollo", "小马智行", "文远知行"],
+    "tech": ["多传感器融合", "SLAM", "组合导航"]
+  },
+  "news_rss_feeds": [],
+  "paper_limit": 5,
+  "news_limit": 8,
+  "paper_lookback_days": 90
+}

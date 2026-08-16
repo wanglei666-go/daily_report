@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-多传感器融合导航每日简报 —— 独立脚本
-部署：放到常开服务器，cron 每天定时运行即可。
-功能：arXiv 抓论文 + 行业资讯 + (可选)LLM 中文提炼 + 推企业微信群机器人。
-依赖：仅 Python3 标准库，无需 pip install。
-
-密钥一律走环境变量或同目录 .llm.env（不要提交到 git）：
+领域每日简报 —— 独立脚本
+论文 / 资讯领域由同目录 topics.json 配置，不写死某一学科。
+密钥走环境变量或 .llm.env（不要提交到 git）：
   WECOM_WEBHOOK   企业微信群机器人 webhook 完整 URL
   LLM_API_KEY / LLM_BASE_URL / LLM_MODEL   可选，OpenAI 兼容接口
+依赖：仅 Python3 标准库。
 """
 import urllib.request, urllib.parse, urllib.error
 import xml.etree.ElementTree as ET
@@ -18,6 +16,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(_HERE, "briefing_state.json")
 LOG_FILE = os.path.join(_HERE, "briefing.log")
 LLM_ENV_FILE = os.path.join(_HERE, ".llm.env")
+TOPICS_FILE = os.path.join(_HERE, "topics.json")
 BJT = datetime.timezone(datetime.timedelta(hours=8))
 
 
@@ -37,71 +36,122 @@ def _load_llm_env_file():
         pass
 
 
+def _as_str_list(v):
+    out = []
+    for x in v or []:
+        s = str(x).strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def _build_arxiv_query(cfg):
+    raw = (cfg.get("arxiv_query") or "").strip()
+    if raw:
+        return raw
+    groups = []
+    for item in cfg.get("arxiv_keywords") or []:
+        if isinstance(item, str):
+            terms = [item]
+        else:
+            terms = list(item)
+        terms = [t.strip().replace('"', "") for t in terms if str(t).strip()]
+        if not terms:
+            continue
+        if len(terms) == 1:
+            groups.append('all:"%s"' % terms[0])
+        else:
+            groups.append("(" + " AND ".join('all:"%s"' % t for t in terms) + ")")
+    if not groups:
+        sys.stderr.write("topics.json 需要填写 arxiv_keywords（或 arxiv_query）。\n")
+        sys.exit(1)
+    return " OR ".join(groups)
+
+
+def _weixin_groups(cfg):
+    raw = cfg.get("weixin_query_groups") or {}
+    if isinstance(raw, list):
+        return [(g, _as_str_list(qs)) for g, qs in raw if _as_str_list(qs)]
+    out = []
+    for name in ("industry", "company", "tech"):
+        qs = _as_str_list(raw.get(name))
+        if qs:
+            out.append((name, qs))
+    for name, qs in raw.items():
+        if name in ("industry", "company", "tech"):
+            continue
+        qs = _as_str_list(qs)
+        if qs:
+            out.append((name, qs))
+    return out
+
+
+def load_topics():
+    if not os.path.isfile(TOPICS_FILE):
+        sys.stderr.write(
+            "缺少 topics.json。请先：\n"
+            "  cp topics.example.json topics.json\n"
+            "然后按自己的领域改检索词。完整示例见 topics.examples/\n")
+        sys.exit(1)
+    with open(TOPICS_FILE, encoding="utf-8") as f:
+        cfg = json.load(f)
+    domain = (cfg.get("domain") or "").strip()
+    if not domain or domain.startswith("在这里填写"):
+        sys.stderr.write("请在 topics.json 里把 domain 改成你的领域中文名。\n")
+        sys.exit(1)
+    title = (cfg.get("title") or "").strip() or (domain + "每日简报")
+    news_focus = (cfg.get("news_focus") or "").strip() or (domain + "行业、相关公司与技术动态")
+    paper_core = [k.lower() for k in _as_str_list(cfg.get("paper_must_include_any"))]
+    paper_also = [k.lower() for k in _as_str_list(cfg.get("paper_also_include_any"))]
+    # 模板占位句不当成真实过滤词
+    paper_core = [k for k in paper_core if "至少命中" not in k and "可留空" not in k]
+    weixin = _weixin_groups(cfg)
+    news_queries = _as_str_list(cfg.get("news_queries"))
+    if not weixin and not news_queries and not _as_str_list(cfg.get("news_rss_feeds")):
+        sys.stderr.write("topics.json 需要至少填写 weixin_query_groups、news_queries 或 news_rss_feeds 之一。\n")
+        sys.exit(1)
+    return {
+        "domain": domain,
+        "title": title,
+        "news_focus": news_focus,
+        "arxiv_query": _build_arxiv_query(cfg),
+        "paper_core": paper_core,
+        "paper_also": paper_also,
+        "paper_exclude": [k.lower() for k in _as_str_list(cfg.get("paper_exclude"))],
+        "news_queries": news_queries,
+        "weixin_query_groups": weixin,
+        "news_rss_feeds": _as_str_list(cfg.get("news_rss_feeds")),
+        "paper_limit": int(cfg.get("paper_limit") or 5),
+        "news_limit": int(cfg.get("news_limit") or 8),
+        "paper_lookback_days": int(cfg.get("paper_lookback_days") or 90),
+        "paper_id_keep": int(cfg.get("paper_id_keep") or 240),
+    }
+
+
 _load_llm_env_file()
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 WEBHOOK = (os.environ.get("WECOM_WEBHOOK") or os.environ.get("WEBHOOK") or "").strip()
+TOPICS = load_topics() if os.path.isfile(TOPICS_FILE) else None
+# 启动时若已有 topics.json 则立刻载入；缺失时留给 __main__ 报错
+if TOPICS is None:
+    TOPICS = {}
 
-# 合并为单次查询（一次请求拿全部，大幅降低 arXiv 限流(429)概率）
-ARXIV_QUERY = (
-    '(all:"sensor fusion" AND (all:localization OR all:navigation OR all:SLAM OR all:odometry)) OR '
-    '(all:"LiDAR-IMU" OR all:"visual-inertial" OR all:"GNSS/INS" OR all:"multi-modal fusion") OR '
-    '(all:"multi-sensor" AND (all:SLAM OR all:navigation OR all:localization)) OR '
-    '(all:"radar" AND all:"camera" AND (all:fusion OR all:perception)) OR '
-    '(all:"sensor fusion" AND (all:robot OR all:autonomous))'
-)
-PAPER_LIMIT = 5          # 每天推送论文篇数
-PAPER_LOOKBACK_DAYS = 90 # 论文池窗口：不要求「今天新发」，从未推过的里取
-PAPER_ID_KEEP = 240      # 已推 arXiv id 最多保留条数（约够轮换数月）
-NEWS_LIMIT = 8  # 简报资讯条数；按类别轮询入选，避免被技术帖占满
-# Bing/Google 检索词：偏行业与公司，不再只盯传感器融合
-NEWS_QUERIES = [
-    "自动驾驶 行业",
-    "智能驾驶 量产",
-    "Robotaxi 自动驾驶",
-    "autonomous driving industry",
-]
-# 自定义 RSS 源（可选）：把你能访问的国内科技/汽车媒体 RSS 填进来，例如
-#   "https://www.qbitai.com/feed",   # 量子位
-#   "https://www.cheddongxi.com/feed",
-# 留空则仅用 Bing/Google News 检索。境内服务器建议至少加 1-2 个国内源。
-NEWS_RSS_FEEDS = []
-# 微信公众号：行业 / 智驾公司 / 技术 三类；抓取后按组轮询，保证简报有行业面
-WEIXIN_QUERY_GROUPS = [
-    ("industry", [
-        "自动驾驶",
-        "智能驾驶",
-        "Robotaxi",
-        "智驾 量产",
-        "高阶智驾",
-    ]),
-    ("company", [
-        "华为智驾",
-        "特斯拉 FSD",
-        "小鹏 智驾",
-        "理想 智驾",
-        "蔚来 智驾",
-        "百度 Apollo",
-        "小马智行",
-        "文远知行",
-    ]),
-    ("tech", [
-        "多传感器融合",
-        "SLAM",
-        "组合导航",
-    ]),
-]
-CORE = ["localization", "navigation", "slam", "odometry", "mapping",
-        "visual-inertial", "vio", "lidar-imu", "gnss", " ins "]
-FUS = ["fusion", "multi-modal", "multimodal", "multi-sensor", "multisensor",
-       "visual-inertial", "lidar-imu", "gnss/ins",
-       "lidar", "imu", "radar", "camera", "gnss", "sensor"]
-# 明显离题领域，命中即排除（避免动作识别/图像修复/行人重识别/光学设计等混入）
-BLOCK = ["action recognition", "action localization", "temporal localization",
-         "person re-identification", "image inpainting", "sketch",
-         "nanophotonic", "color router", "inverse design",
-         "histopath", "medical imaging"]
+ARXIV_QUERY = TOPICS.get("arxiv_query", "")
+PAPER_LIMIT = TOPICS.get("paper_limit", 5)
+PAPER_LOOKBACK_DAYS = TOPICS.get("paper_lookback_days", 90)
+PAPER_ID_KEEP = TOPICS.get("paper_id_keep", 240)
+NEWS_LIMIT = TOPICS.get("news_limit", 8)
+NEWS_QUERIES = TOPICS.get("news_queries", [])
+NEWS_RSS_FEEDS = TOPICS.get("news_rss_feeds", [])
+WEIXIN_QUERY_GROUPS = TOPICS.get("weixin_query_groups", [])
+CORE = TOPICS.get("paper_core", [])
+FUS = TOPICS.get("paper_also", [])
+BLOCK = TOPICS.get("paper_exclude", [])
+BRIEF_TITLE = TOPICS.get("title", "每日简报")
+DOMAIN = TOPICS.get("domain", "")
+NEWS_FOCUS = TOPICS.get("news_focus", "")
 
 
 def now_bjt():
@@ -147,6 +197,17 @@ def save_state(s):
         log("save state failed: %s" % e)
 
 
+def _paper_ok(text):
+    t = text.lower()
+    if any(b in t for b in BLOCK):
+        return False
+    if CORE and sum(k in t for k in CORE) < 1:
+        return False
+    if FUS and sum(k in t for k in FUS) < 1:
+        return False
+    return True
+
+
 def fetch_arxiv(since_date):
     papers = {}
     url = ("http://export.arxiv.org/api/query?search_query=%s"
@@ -164,31 +225,29 @@ def fetch_arxiv(since_date):
         log("arxiv 全部请求失败，本次跳过论文")
         return papers
     for m in re.finditer(r"<entry>(.*?)</entry>", data, re.S):
-            e = m.group(1)
-            aid = re.search(r"<id>(.*?)</id>", e)
-            if not aid or "/abs/" not in aid.group(1):
-                continue
-            aid = aid.group(1).strip()
-            arxiv_id = aid.split("/abs/")[-1]
-            published = re.search(r"<published>(.*?)</published>", e).group(1)[:10]
-            try:
-                pdate = datetime.date.fromisoformat(published)
-            except Exception:
-                continue
-            if pdate < since_date:
-                continue
-            title = re.search(r"<title>(.*?)</title>", e, re.S).group(1).replace("\n", " ").strip()
-            summary = re.search(r"<summary>(.*?)</summary>", e, re.S).group(1).replace("\n", " ").strip()
-            authors = re.findall(r"<name>(.*?)</name>", e)
-            authors = ", ".join(authors[:3]) + (" 等" if len(authors) > 3 else "")
-            t = (title + " " + summary).lower()
-            if any(b in t for b in BLOCK):
-                continue
-            if sum(k in t for k in CORE) >= 1 and sum(k in t for k in FUS) >= 1:
-                if arxiv_id not in papers:
-                    papers[arxiv_id] = {"arxiv_id": arxiv_id, "title": title,
-                                        "published": published, "summary": summary,
-                                        "authors": authors, "url": aid}
+        e = m.group(1)
+        aid = re.search(r"<id>(.*?)</id>", e)
+        if not aid or "/abs/" not in aid.group(1):
+            continue
+        aid = aid.group(1).strip()
+        arxiv_id = aid.split("/abs/")[-1]
+        published = re.search(r"<published>(.*?)</published>", e).group(1)[:10]
+        try:
+            pdate = datetime.date.fromisoformat(published)
+        except Exception:
+            continue
+        if pdate < since_date:
+            continue
+        title = re.search(r"<title>(.*?)</title>", e, re.S).group(1).replace("\n", " ").strip()
+        summary = re.search(r"<summary>(.*?)</summary>", e, re.S).group(1).replace("\n", " ").strip()
+        authors = re.findall(r"<name>(.*?)</name>", e)
+        authors = ", ".join(authors[:3]) + (" 等" if len(authors) > 3 else "")
+        if not _paper_ok(title + " " + summary):
+            continue
+        if arxiv_id not in papers:
+            papers[arxiv_id] = {"arxiv_id": arxiv_id, "title": title,
+                                "published": published, "summary": summary,
+                                "authors": authors, "url": aid}
     return papers
 
 
@@ -202,7 +261,7 @@ def pick_papers(arxiv_all, pushed_ids, k=PAPER_LIMIT):
     n_fresh = len(picked)
     if len(picked) < k:
         picked_ids = set(p["arxiv_id"] for p in picked)
-        for aid in pushed_ids:  # 列表头部 = 更早推过，先轮换回来
+        for aid in pushed_ids:
             if len(picked) >= k:
                 break
             p = arxiv_all.get(aid)
@@ -216,7 +275,6 @@ def pick_papers(arxiv_all, pushed_ids, k=PAPER_LIMIT):
 
 
 def update_pushed_ids(pushed_ids, picked):
-    """今日已推的 id 移到队尾；超出 PAPER_ID_KEEP 则丢掉最旧的。"""
     today_ids = [p["arxiv_id"] for p in picked]
     today_set = set(today_ids)
     rest = [i for i in (pushed_ids or []) if i not in today_set]
@@ -224,7 +282,6 @@ def update_pushed_ids(pushed_ids, picked):
 
 
 def _parse_rss_items(data):
-    """从 RSS xml 文本解析出 (title, link, pub) 列表，解析失败返回 []。"""
     out = []
     try:
         root = ET.fromstring(data)
@@ -241,7 +298,6 @@ def _parse_rss_items(data):
 
 
 def fetch_news_weixin():
-    """搜狗微信搜索(type=2 文章)：按关键词实时抓最新公众号文章 + 摘要。境内最稳的资讯源。"""
     items, seen = [], set()
     for group, queries in WEIXIN_QUERY_GROUPS:
         for q in queries:
@@ -251,12 +307,11 @@ def fetch_news_weixin():
             except Exception as e:
                 log("weixin search failed (%s): %s" % (q, e))
                 continue
-            # 按结果块(txt-box)切分，块内抓「标题链接 + 文章摘要」，避免错位
             for b in data.split('<div class="txt-box">')[1:]:
                 links = re.findall(r'<a[^>]*href="(/link\?url=[^"]+)"[^>]*>(.*?)</a>', b, re.S)
                 mlink = None
                 for href, t in links:
-                    if html.unescape(re.sub(r"<[^>]+>", "", t)).strip():  # 跳过图片空链接
+                    if html.unescape(re.sub(r"<[^>]+>", "", t)).strip():
                         mlink = (href, t)
                         break
                 if not mlink:
@@ -315,7 +370,6 @@ def fetch_news_feeds():
 
 
 def fetch_news():
-    """多源容错：微信(搜狗)优先；够用则跳过境内常超时的 Bing/Google。"""
     items, seen = [], set()
 
     def _merge(src):
@@ -338,7 +392,6 @@ def fetch_news():
 
 
 def pick_diverse_news(items, k=NEWS_LIMIT):
-    """按 industry / company / tech 轮询取条，避免简报被同一类技术帖占满。"""
     buckets, order = {}, []
     for n in items:
         g = n.get("group") or "other"
@@ -366,26 +419,25 @@ def pick_diverse_news(items, k=NEWS_LIMIT):
 
 
 def llm_enrich(papers, news):
-    """可选：用 LLM 生成中文简报正文（一二部分）。失败返回 None 走兜底。"""
     if not LLM_API_KEY:
         return None
     papers_payload = [{"title": p["title"], "authors": p["authors"], "url": p["url"], "summary": p["summary"]} for p in papers]
     news_payload = [{"title": n["title"], "link": n["link"], "summary": n.get("summary", "")} for n in news]
-    sys_p = ("你是「多传感器融合导航」领域每日简报助手。根据以下 arXiv 论文与行业新闻，"
+    sys_p = ("你是「%s」领域每日简报助手。根据以下 arXiv 论文与行业新闻，"
              "生成中文简报正文(markdown，不要总标题)：\n"
              "【论文】%s\n【新闻】%s\n"
-             "要求：\n一、论文(≤%d篇,时间倒序，来自近90天池的每日轮换，不必全是当天新发)：每篇 `[标题](url)` | 代码✅/❌/❓ | SOTA✅/❓ | "
-             "**仅1-2句**中文创新点(≤45字，说明用了什么融合方法/新架构、解决什么痛点；代码/SOTA据摘要可判定性标✅/❌/❓)。\n"
-             "二、行业资讯(≤%d条)：覆盖自动驾驶行业、智驾公司（华为/特斯拉/新势力/Robotaxi等）、量产与政策，可含少量传感器融合技术资讯；不要全是技术教程。每条**仅1句**中文要点(基于标题与摘要，突出事件/政策/量产/公司动向等要害，≤40字) + `[来源](link)`。\n"
+             "要求：\n一、论文(≤%d篇,时间倒序，来自近%d天池的每日轮换，不必全是当天新发)：每篇 `[标题](url)` | 代码✅/❌/❓ | SOTA✅/❓ | "
+             "**仅1-2句**中文创新点(≤45字，说明方法/架构与解决的问题；代码/SOTA据摘要可判定性标✅/❌/❓)。\n"
+             "二、行业资讯(≤%d条)：覆盖%s；不要全是技术教程。每条**仅1句**中文要点(基于标题与摘要，突出事件/政策/产品/公司动向等要害，≤40字) + `[来源](link)`。\n"
              "只输出这两部分 markdown，不要多余解释。" % (
+                 DOMAIN,
                  json.dumps(papers_payload, ensure_ascii=False),
                  json.dumps(news_payload, ensure_ascii=False),
-                 PAPER_LIMIT, NEWS_LIMIT))
+                 PAPER_LIMIT, PAPER_LOOKBACK_DAYS, NEWS_LIMIT, NEWS_FOCUS))
     payload = {"model": LLM_MODEL, "messages": [
         {"role": "system", "content": sys_p},
         {"role": "user", "content": "请生成简报正文。"},
     ], "temperature": 0.3}
-    # V4 Flash 默认思考模式，简报提炼不需要，关掉更稳更快
     if "deepseek" in (LLM_MODEL + LLM_BASE_URL).lower():
         payload["thinking"] = {"type": "disabled"}
     body = json.dumps(payload).encode("utf-8")
@@ -419,7 +471,7 @@ def fallback_body(papers, news):
             % (PAPER_LIMIT, paper_block, NEWS_LIMIT, news_block))
 
 
-WX_MD_LIMIT = 3500  # 企业微信 markdown 上限 4096 字节，留余量
+WX_MD_LIMIT = 3500
 
 
 def post_markdown(content):
@@ -440,7 +492,6 @@ def post_markdown(content):
 
 
 def split_markdown_chunks(content, limit=WX_MD_LIMIT):
-    """按段落切到企业微信字节上限以内。"""
     if len(content.encode("utf-8")) <= limit:
         return [content]
     parts = re.split(r"(\n{2,})", content)
@@ -452,7 +503,6 @@ def split_markdown_chunks(content, limit=WX_MD_LIMIT):
             buf = part.lstrip("\n")
             if len(buf.encode("utf-8")) <= limit:
                 continue
-            # 单段仍超长：按行再切
             line_buf = ""
             for line in buf.split("\n"):
                 cand_l = (line_buf + "\n" + line) if line_buf else line
@@ -496,7 +546,7 @@ def main():
 
     date_str = today.isoformat()
     if not new_papers and not new_news:
-        body = "📡 多传感器融合导航每日简报 · %s：今日无新增内容" % date_str
+        body = "📡 %s · %s：今日无新增内容" % (BRIEF_TITLE, date_str)
         log("post: " + post_markdown(body))
         save_state({"pushed_paper_ids": pushed_ids[-PAPER_ID_KEEP:],
                     "news_titles": recent_news[-40:],
@@ -508,24 +558,26 @@ def main():
         body_mid = enriched
     else:
         body_mid = fallback_body(new_papers, new_news)
-    header = "📡 **多传感器融合导航每日简报 · %s**\n\n" % date_str
-    notes = ("\n\n> 说明：论文取自 arXiv 近%d天池（每日轮换未推过的，不要求当天新发）；行业资讯来自搜狗微信搜索，覆盖自动驾驶行业、智驾公司与相关技术，"
+    header = "📡 **%s · %s**\n\n" % (BRIEF_TITLE, date_str)
+    notes = ("\n\n> 说明：论文取自 arXiv 近%d天池（每日轮换未推过的，不要求当天新发）；行业资讯来自搜狗微信等检索，覆盖%s。"
              "摘要为文章开头片段仅供参考。"
-             % PAPER_LOOKBACK_DAYS
+             % (PAPER_LOOKBACK_DAYS, NEWS_FOCUS)
              if not LLM_API_KEY else
-             "\n\n> 说明：内容由 LLM 中文提炼；论文取自 arXiv 近%d天池每日轮换，行业资讯覆盖自动驾驶行业、智驾公司与相关技术。"
-             % PAPER_LOOKBACK_DAYS)
+             "\n\n> 说明：内容由 LLM 中文提炼；论文取自 arXiv 近%d天池每日轮换，资讯覆盖%s。"
+             % (PAPER_LOOKBACK_DAYS, NEWS_FOCUS))
     content = header + body_mid + notes
     post_briefing(content)
 
     save_state({"pushed_paper_ids": update_pushed_ids(pushed_ids, new_papers),
                 "news_titles": (recent_news + [n["title"] for n in new_news])[-40:],
                 "last_run": now_bjt().isoformat()})
-    log("done. papers=%d news=%d llm=%s" % (
-        len(new_papers), len(new_news), "on" if LLM_API_KEY else "off"))
+    log("done. papers=%d news=%d llm=%s domain=%s" % (
+        len(new_papers), len(new_news), "on" if LLM_API_KEY else "off", DOMAIN))
 
 
 if __name__ == "__main__":
+    if not os.path.isfile(TOPICS_FILE):
+        load_topics()
     if not WEBHOOK:
         sys.stderr.write("缺少 WECOM_WEBHOOK：请复制 .llm.env.example 为 .llm.env 并填入企业微信机器人地址。\n")
         sys.exit(1)

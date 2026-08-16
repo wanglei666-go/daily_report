@@ -1,0 +1,27 @@
+{
+  "domain": "在这里填写领域中文名，例如：大语言模型 / 量子计算 / 肿瘤免疫",
+  "title": "",
+  "news_focus": "",
+  "arxiv_keywords": [
+    ["english keyword one"],
+    ["keyword two", "optional AND term"]
+  ],
+  "paper_must_include_any": [
+    "至少命中其中一个英文词才收录，可留空表示不额外过滤"
+  ],
+  "paper_also_include_any": [],
+  "paper_exclude": [],
+  "news_queries": [
+    "中文行业检索词",
+    "english industry query"
+  ],
+  "weixin_query_groups": {
+    "industry": ["行业关键词1", "行业关键词2"],
+    "company": ["公司或产品名1", "公司或产品名2"],
+    "tech": ["技术关键词1", "技术关键词2"]
+  },
+  "news_rss_feeds": [],
+  "paper_limit": 5,
+  "news_limit": 8,
+  "paper_lookback_days": 90
+}
