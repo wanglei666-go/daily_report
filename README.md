@@ -1,28 +1,24 @@
 # 领域每日简报
 
-每天自动把 **arXiv 新论文** 和 **行业资讯** 汇总成一条中文简报，推到企业微信群。
+每天自动汇总 **arXiv 论文** 与 **行业资讯**，整理成一条中文简报，推送到企业微信群。
 
-适合课题组、实验室、产品团队：不想每天手翻 arXiv / 公众号，又希望信息别太散。
-
----
-
-## 它能做什么
-
-| | |
-| --- | --- |
-| 论文 | 按你设定的关键词从 arXiv 抓取，近 90 天池子轮换，保证几乎每天都有内容 |
-| 资讯 | 优先搜狗微信（公众号），可选 Bing / Google News / 自定义 RSS |
-| 提炼 | 可选接入 DeepSeek / OpenAI 等兼容接口，把长摘要压成几句中文要点 |
-| 推送 | 企业微信群机器人；内容过长会自动拆成多条 |
-| 领域 | **不写死某一学科**——换课题只改配置文件，一般不用动代码 |
-
-纯 Python 3 标准库，无需 `pip install`；不占 GPU；跑完约 1 分钟即退出。论文标题与 arXiv 链接由本地固定组装，避免和正文对不上。
+换领域只改配置，不用改代码。适合课题组、实验室或需要跟进某一方向的小团队。
 
 ---
 
-## 效果长什么样
+## 功能
 
-推到群里大致是：
+- **论文**：按关键词从 arXiv 抓取；近 90 天做成池子轮换推送，不依赖当天必须有新投稿
+- **资讯**：优先搜狗微信（公众号），也可使用 Bing / Google News 或自定义 RSS
+- **提炼**：可接入 DeepSeek、OpenAI 等兼容接口，将摘要压成几句中文要点；不接入也能运行
+- **推送**：企业微信群机器人；内容过长时自动拆成多条
+- **轻量**：仅 Python 3 标准库，无需安装第三方包；不占用 GPU
+
+论文标题与 arXiv 链接由程序本地组装，与正文一一对应。
+
+---
+
+## 推送效果示例
 
 ```text
 📡 多传感器融合导航每日简报 · 2026-08-19
@@ -33,50 +29,48 @@
 > 一两句中文创新点……
 
 ## 二、行业资讯
-1. **某公司量产/政策动态**
+1. **行业或公司动态标题**
 > 一句要点
    [来源](...)
 ```
 
-仓库里带了一个完整示例配置：多传感器融合 / 自动驾驶（`topics.examples/sensor-fusion.json`）。换成你自己的领域即可。
+仓库提供完整示例配置（多传感器融合 / 自动驾驶）：`topics.examples/sensor-fusion.json`。
 
 ---
 
-## 快速开始
+## 使用步骤
 
-### 1. 拿到代码
+### 1. 获取代码
 
 ```bash
 git clone https://github.com/wanglei666-go/daily_report.git
 cd daily_report
 ```
 
-### 2. 复制两份配置
+### 2. 准备配置文件
 
 ```bash
-cp topics.example.json topics.json          # 领域：论文词、资讯词
-cp .llm.env.example .llm.env                # 密钥：企业微信；可选 LLM
+cp topics.example.json topics.json
+cp .llm.env.example .llm.env
 ```
 
-想先跑通「传感器融合」示例：
+若希望直接使用传感器融合示例：
 
 ```bash
 cp topics.examples/sensor-fusion.json topics.json
 ```
 
-### 3. 填企业微信机器人（必填）
+### 3. 配置企业微信机器人
 
-1. 打开目标企业微信群 → 群设置 → 群机器人 → 添加  
-2. 复制 webhook 完整 URL  
-3. 写入 `.llm.env`：
+在目标群中：群设置 → 群机器人 → 添加，复制 webhook，写入 `.llm.env`：
 
 ```bash
 WECOM_WEBHOOK=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=你的key
 ```
 
-### 4.（可选）开 LLM 中文提炼
+### 4. （可选）配置 LLM
 
-不配也能跑，论文会用英文摘要兜底。推荐 DeepSeek 等 OpenAI 兼容接口：
+用于中文提炼。未配置时，论文部分使用英文摘要。
 
 ```bash
 LLM_API_KEY=sk-你的key
@@ -84,76 +78,64 @@ LLM_BASE_URL=https://api.deepseek.com
 LLM_MODEL=deepseek-v4-flash
 ```
 
-### 5. 试跑一次
+### 5. 试运行
 
 ```bash
 python3 briefing_server.py
 ```
 
-群里出现简报，且终端/日志里有 `post: {"errcode":0,"errmsg":"ok"}` 即成功。
+群内收到简报，且输出中出现 `errcode:0` 即表示成功。
 
-### 6. 设成每天自动发
+### 6. 定时每天发送
 
-机器保持开机，安装 cron 后：
+在常开服务器上配置 cron（示例：每天 09:30，北京时间）：
 
 ```bash
 chmod +x run_briefing.sh
 crontab -e
 ```
 
-加入（把路径改成你本机的绝对路径；下面是每天 09:30 北京时间）：
-
 ```cron
 MAILTO=""
 TZ=Asia/Shanghai
-30 9 * * * /你的路径/daily_report/run_briefing.sh
+30 9 * * * /你的安装路径/daily_report/run_briefing.sh
 ```
-
-退出 SSH 也会继续跑。查看任务：`crontab -l`。日志文件：`briefing.log`。
 
 ---
 
-## 配置说明
+## 配置项说明
 
-### `topics.json`（领域）
+### `topics.json`
 
-| 字段 | 说明 |
+| 字段 | 含义 |
 | --- | --- |
-| `domain` | 领域中文名（标题、LLM 提示都会用到） |
-| `title` | 简报标题；可留空，默认「{domain}每日简报」 |
-| `arxiv_keywords` | arXiv 检索：每组内 AND，组之间 OR。例 `["sensor fusion","SLAM"]` |
-| `weixin_query_groups` | 公众号关键词，建议分 `industry` / `company` / `tech`，简报会轮询取条 |
-| `news_queries` | Bing / Google 检索词（境内常不稳定，作兜底） |
-| `news_rss_feeds` | 可选自定义 RSS |
-| `paper_must_include_any` / `paper_also_include_any` | 标题+摘要还需命中的英文词；可留空 |
-| `paper_exclude` | 命中则丢弃（挡离题论文） |
-| `news_focus` | 告诉 LLM 资讯侧要突出什么 |
-| `paper_limit` / `news_limit` / `paper_lookback_days` | 每天篇数、资讯条数、论文池窗口（默认 90 天） |
+| `domain` | 领域名称 |
+| `title` | 简报标题；为空时使用「{domain}每日简报」 |
+| `arxiv_keywords` | arXiv 检索词；同一组内为 AND，组与组之间为 OR |
+| `weixin_query_groups` | 公众号检索，建议按 industry / company / tech 分组 |
+| `news_queries` | Bing / Google 检索词 |
+| `news_rss_feeds` | 自定义 RSS 地址列表 |
+| `paper_must_include_any` / `paper_also_include_any` | 论文标题与摘要的额外过滤词，可为空 |
+| `paper_exclude` | 排除词 |
+| `news_focus` | 资讯侧关注重点，供 LLM 参考 |
+| `paper_limit` / `news_limit` / `paper_lookback_days` | 每天论文篇数、资讯条数、论文回溯天数 |
 
-### `.llm.env`（密钥）
+### `.llm.env`
 
-| 变量 | 必填 | 说明 |
+| 变量 | 是否必需 | 含义 |
 | --- | --- | --- |
-| `WECOM_WEBHOOK` | 是 | 企业微信机器人完整 URL |
-| `LLM_API_KEY` | 否 | 有则中文提炼；无则英文摘要兜底 |
-| `LLM_BASE_URL` / `LLM_MODEL` | 否 | OpenAI 兼容接口地址与模型名 |
-
-不要把 `.llm.env`、`topics.json`、真实 key 提交到 Git。仓库已用 `.gitignore` 排除运行产物与本地密钥。
+| `WECOM_WEBHOOK` | 是 | 企业微信机器人 webhook |
+| `LLM_API_KEY` | 否 | LLM 密钥 |
+| `LLM_BASE_URL` / `LLM_MODEL` | 否 | 接口地址与模型名 |
 
 ---
 
-## 仓库结构
+## 文件说明
 
-```text
-briefing_server.py      # 主脚本
-run_briefing.sh         # cron 启动包装
-topics.example.json     # 空白领域模板
-topics.examples/        # 可直接复制的完整示例
-.llm.env.example        # 密钥模板
-.gitignore
-```
-
-运行后本地还会生成（请勿提交）：
-
-- `briefing_state.json`：去重与论文缓存  
-- `briefing.log`：运行日志  
+| 文件 | 说明 |
+| --- | --- |
+| `briefing_server.py` | 主程序 |
+| `run_briefing.sh` | 定时任务启动脚本 |
+| `topics.example.json` | 领域配置模板 |
+| `topics.examples/` | 可直接套用的领域示例 |
+| `.llm.env.example` | 密钥配置模板 |
