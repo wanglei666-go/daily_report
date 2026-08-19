@@ -37,12 +37,10 @@ cp topics.examples/sensor-fusion.json topics.json
 常用选填：
 
 - `title`：简报标题；留空则用「{domain}每日简报」
-- `news_focus`：告诉 LLM 资讯侧要覆盖什么；留空则用「{domain}行业、相关公司与技术动态」
+- `news_focus`：告诉 LLM 资讯侧要覆盖什么
 - `paper_must_include_any` / `paper_also_include_any`：标题+摘要还需命中的英文词（可留空）
 - `paper_exclude`：命中则丢弃
 - `paper_limit` / `news_limit` / `paper_lookback_days`
-
-`arxiv_keywords` 示例：要搜同时含 A 和 B 的论文，写成 `["A", "B"]`；只要其中一个词，写成单独一组 `["A"]`。
 
 ## 2. 填写密钥 `.llm.env`
 
@@ -81,6 +79,11 @@ TZ=Asia/Shanghai
 ```
 
 这是系统 crontab，退出 SSH 后仍会执行。查看：`crontab -l`。日志：`briefing.log`。
+
+## 论文链接如何保证正确
+
+- **标题与 arXiv 链接由本地代码组装**，LLM 只生成中文要点，不会改写/错配链接
+- arXiv 早高峰若 429/超时，会回退到上次成功的 `paper_cache`，继续按 ID 轮换推送
 
 ## 论文怎么保证每天都有
 

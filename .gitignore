@@ -1,0 +1,17 @@
+# 密钥与本地领域配置
+.llm.env
+.env
+topics.json
+
+# 运行产物
+briefing.log
+briefing_state.json
+__pycache__/
+*.pyc
+*.pyo
+
+# 打包与编辑器
+*.zip
+.DS_Store
+.idea/
+.vscode/

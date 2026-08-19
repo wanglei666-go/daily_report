@@ -7,6 +7,9 @@
   WECOM_WEBHOOK   企业微信群机器人 webhook 完整 URL
   LLM_API_KEY / LLM_BASE_URL / LLM_MODEL   可选，OpenAI 兼容接口
 依赖：仅 Python3 标准库。
+
+论文标题与链接由本地组装；LLM 只生成中文要点，避免链接错配。
+arXiv 失败时回退 paper_cache，保证每日仍能轮换推送。
 """
 import urllib.request, urllib.parse, urllib.error
 import xml.etree.ElementTree as ET
@@ -21,7 +24,6 @@ BJT = datetime.timezone(datetime.timedelta(hours=8))
 
 
 def _load_llm_env_file():
-    """读取 .llm.env；已有环境变量优先，不覆盖。"""
     try:
         with open(LLM_ENV_FILE, encoding="utf-8") as f:
             for line in f:
@@ -103,7 +105,6 @@ def load_topics():
     news_focus = (cfg.get("news_focus") or "").strip() or (domain + "行业、相关公司与技术动态")
     paper_core = [k.lower() for k in _as_str_list(cfg.get("paper_must_include_any"))]
     paper_also = [k.lower() for k in _as_str_list(cfg.get("paper_also_include_any"))]
-    # 模板占位句不当成真实过滤词
     paper_core = [k for k in paper_core if "至少命中" not in k and "可留空" not in k]
     weixin = _weixin_groups(cfg)
     news_queries = _as_str_list(cfg.get("news_queries"))
@@ -133,10 +134,7 @@ LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstri
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 WEBHOOK = (os.environ.get("WECOM_WEBHOOK") or os.environ.get("WEBHOOK") or "").strip()
-TOPICS = load_topics() if os.path.isfile(TOPICS_FILE) else None
-# 启动时若已有 topics.json 则立刻载入；缺失时留给 __main__ 报错
-if TOPICS is None:
-    TOPICS = {}
+TOPICS = load_topics() if os.path.isfile(TOPICS_FILE) else {}
 
 ARXIV_QUERY = TOPICS.get("arxiv_query", "")
 PAPER_LIMIT = TOPICS.get("paper_limit", 5)
@@ -208,29 +206,39 @@ def _paper_ok(text):
     return True
 
 
+def _norm_arxiv_url(aid_or_url):
+    s = (aid_or_url or "").strip()
+    if "/abs/" in s:
+        arxiv_id = s.split("/abs/")[-1].strip()
+    else:
+        arxiv_id = s
+    arxiv_id = arxiv_id.split("?")[0].strip()
+    return "https://arxiv.org/abs/%s" % arxiv_id, arxiv_id
+
+
 def fetch_arxiv(since_date):
     papers = {}
-    url = ("http://export.arxiv.org/api/query?search_query=%s"
+    url = ("https://export.arxiv.org/api/query?search_query=%s"
            "&sortBy=submittedDate&sortOrder=descending&max_results=200"
            % urllib.parse.quote(ARXIV_QUERY))
     data = None
-    for attempt in range(3):
+    for attempt in range(4):
         try:
-            data = http_get(url)
+            data = http_get(url, timeout=45)
             break
         except Exception as e:
-            log("arxiv query failed (attempt %d): %s" % (attempt + 1, e))
-            time.sleep(5)
+            wait = 8 * (attempt + 1)
+            log("arxiv query failed (attempt %d): %s; sleep %ds" % (attempt + 1, e, wait))
+            time.sleep(wait)
     if not data:
-        log("arxiv 全部请求失败，本次跳过论文")
+        log("arxiv 全部请求失败，本次跳过在线抓取")
         return papers
     for m in re.finditer(r"<entry>(.*?)</entry>", data, re.S):
         e = m.group(1)
         aid = re.search(r"<id>(.*?)</id>", e)
         if not aid or "/abs/" not in aid.group(1):
             continue
-        aid = aid.group(1).strip()
-        arxiv_id = aid.split("/abs/")[-1]
+        url_abs, arxiv_id = _norm_arxiv_url(aid.group(1))
         published = re.search(r"<published>(.*?)</published>", e).group(1)[:10]
         try:
             pdate = datetime.date.fromisoformat(published)
@@ -247,12 +255,35 @@ def fetch_arxiv(since_date):
         if arxiv_id not in papers:
             papers[arxiv_id] = {"arxiv_id": arxiv_id, "title": title,
                                 "published": published, "summary": summary,
-                                "authors": authors, "url": aid}
+                                "authors": authors, "url": url_abs}
     return papers
 
 
+def load_paper_cache(state):
+    cache = state.get("paper_cache") or {}
+    out = {}
+    for aid, p in cache.items():
+        if not isinstance(p, dict) or not p.get("title"):
+            continue
+        url, arxiv_id = _norm_arxiv_url(p.get("url") or aid)
+        out[arxiv_id] = {
+            "arxiv_id": arxiv_id,
+            "title": p.get("title", ""),
+            "published": p.get("published", ""),
+            "summary": p.get("summary", ""),
+            "authors": p.get("authors", ""),
+            "url": url,
+        }
+    return out
+
+
+def save_paper_cache(papers):
+    return {aid: {"arxiv_id": p["arxiv_id"], "title": p["title"], "published": p["published"],
+                  "summary": p.get("summary", "")[:500], "authors": p.get("authors", ""),
+                  "url": p["url"]} for aid, p in papers.items()}
+
+
 def pick_papers(arxiv_all, pushed_ids, k=PAPER_LIMIT):
-    """每天固定推 k 篇：优先近窗口内从未推过的（新→旧）；不够则从最早推过的开始轮换。"""
     pushed_ids = list(pushed_ids or [])
     pushed_set = set(pushed_ids)
     unseen = [p for aid, p in arxiv_all.items() if aid not in pushed_set]
@@ -418,26 +449,53 @@ def pick_diverse_news(items, k=NEWS_LIMIT):
     return picked
 
 
+def _parse_llm_json(text):
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", text, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+
 def llm_enrich(papers, news):
+    """LLM 只返回中文要点 JSON；标题与链接一律由本地组装。"""
     if not LLM_API_KEY:
         return None
-    papers_payload = [{"title": p["title"], "authors": p["authors"], "url": p["url"], "summary": p["summary"]} for p in papers]
-    news_payload = [{"title": n["title"], "link": n["link"], "summary": n.get("summary", "")} for n in news]
-    sys_p = ("你是「%s」领域每日简报助手。根据以下 arXiv 论文与行业新闻，"
-             "生成中文简报正文(markdown，不要总标题)：\n"
-             "【论文】%s\n【新闻】%s\n"
-             "要求：\n一、论文(≤%d篇,时间倒序，来自近%d天池的每日轮换，不必全是当天新发)：每篇 `[标题](url)` | 代码✅/❌/❓ | SOTA✅/❓ | "
-             "**仅1-2句**中文创新点(≤45字，说明方法/架构与解决的问题；代码/SOTA据摘要可判定性标✅/❌/❓)。\n"
-             "二、行业资讯(≤%d条)：覆盖%s；不要全是技术教程。每条**仅1句**中文要点(基于标题与摘要，突出事件/政策/产品/公司动向等要害，≤40字) + `[来源](link)`。\n"
-             "只输出这两部分 markdown，不要多余解释。" % (
-                 DOMAIN,
-                 json.dumps(papers_payload, ensure_ascii=False),
-                 json.dumps(news_payload, ensure_ascii=False),
-                 PAPER_LIMIT, PAPER_LOOKBACK_DAYS, NEWS_LIMIT, NEWS_FOCUS))
+    papers_payload = [{
+        "id": p["arxiv_id"],
+        "title": p["title"],
+        "summary": p["summary"][:900],
+    } for p in papers]
+    news_payload = [{
+        "i": i,
+        "title": n["title"],
+        "summary": n.get("summary", ""),
+    } for i, n in enumerate(news)]
+    sys_p = (
+        "你是「%s」领域每日简报助手。根据给定论文与新闻，只输出一个 JSON 对象，不要 markdown，不要编造论文或链接。\n"
+        "格式：{\"papers\":[{\"id\":\"与输入完全一致的arxiv id\",\"code\":\"✅或❌或❓\",\"sota\":\"✅或❓\",\"blurb\":\"中文1-2句≤45字\"}],"
+        "\"news\":[{\"i\":0,\"blurb\":\"中文1句≤40字\"}]}\n"
+        "规则：papers/news 条数分别不超过输入；id/i 必须来自输入；不要输出 url；没有内容时对应数组为空。\n"
+        "资讯侧请覆盖：%s\n"
+        "【论文】%s\n【新闻】%s" % (
+            DOMAIN, NEWS_FOCUS,
+            json.dumps(papers_payload, ensure_ascii=False),
+            json.dumps(news_payload, ensure_ascii=False),
+        )
+    )
     payload = {"model": LLM_MODEL, "messages": [
         {"role": "system", "content": sys_p},
-        {"role": "user", "content": "请生成简报正文。"},
-    ], "temperature": 0.3}
+        {"role": "user", "content": "请只输出 JSON。"},
+    ], "temperature": 0.2}
     if "deepseek" in (LLM_MODEL + LLM_BASE_URL).lower():
         payload["thinking"] = {"type": "disabled"}
     body = json.dumps(payload).encode("utf-8")
@@ -448,27 +506,65 @@ def llm_enrich(papers, news):
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
             resp = json.loads(r.read().decode("utf-8"))
-        content = (resp.get("choices") or [{}])[0].get("message", {}).get("content") or ""
-        return content.strip() or None
+        raw = (resp.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+        data = _parse_llm_json(raw)
+        if not isinstance(data, dict):
+            log("llm enrich: JSON parse failed")
+            return None
+        return assemble_body(papers, news, data)
     except Exception as e:
         log("llm enrich failed, fallback: %s" % e)
         return None
 
 
-def fallback_body(papers, news):
+def assemble_body(papers, news, llm_data=None):
+    llm_data = llm_data or {}
+    paper_meta = {}
+    for item in llm_data.get("papers") or []:
+        if not isinstance(item, dict):
+            continue
+        pid = str(item.get("id") or "").strip()
+        if pid:
+            paper_meta[pid] = item
+            paper_meta[pid.split("v")[0]] = item
+
     p_lines = []
     for p in papers:
-        snippet = re.sub(r"\s+", " ", p["summary"])[:130]
-        p_lines.append("**[%s](%s)**\n> 代码❓ | SOTA❓\n> 摘要：%s" % (p["title"], p["url"], snippet))
+        meta = paper_meta.get(p["arxiv_id"]) or paper_meta.get(p["arxiv_id"].split("v")[0]) or {}
+        code = meta.get("code") if meta.get("code") in ("✅", "❌", "❓") else "❓"
+        sota = meta.get("sota") if meta.get("sota") in ("✅", "❓") else "❓"
+        blurb = re.sub(r"\s+", " ", str(meta.get("blurb") or "").strip())
+        if not blurb:
+            blurb = re.sub(r"\s+", " ", p["summary"])[:90]
+        p_lines.append("**[%s](%s)**\n> 代码%s | SOTA%s\n> %s" % (
+            p["title"], p["url"], code, sota, blurb))
     paper_block = "\n\n".join(p_lines) if p_lines else "今日无新增论文"
+
+    news_meta = {}
+    for item in llm_data.get("news") or []:
+        if isinstance(item, dict) and "i" in item:
+            try:
+                news_meta[int(item["i"])] = item
+            except Exception:
+                pass
+
     n_lines = []
     for i, n in enumerate(news):
-        s = n.get("summary", "")
-        summ_line = ("\n> %s" % s) if s else ""
-        n_lines.append("%d. **%s**%s\n   [来源](%s)" % (i + 1, n["title"], summ_line, n["link"]))
+        meta = news_meta.get(i) or {}
+        blurb = re.sub(r"\s+", " ", str(meta.get("blurb") or "").strip())
+        if not blurb:
+            blurb = n.get("summary") or ""
+        if blurb:
+            n_lines.append("%d. **%s**\n> %s\n   [来源](%s)" % (i + 1, n["title"], blurb, n["link"]))
+        else:
+            n_lines.append("%d. **%s**\n   [来源](%s)" % (i + 1, n["title"], n["link"]))
     news_block = "\n".join(n_lines) if n_lines else "今日无重大行业资讯"
     return ("## 一、论文（≤%d 篇）\n%s\n\n## 二、行业资讯（≤%d 条）\n%s"
             % (PAPER_LIMIT, paper_block, NEWS_LIMIT, news_block))
+
+
+def fallback_body(papers, news):
+    return assemble_body(papers, news, None)
 
 
 WX_MD_LIMIT = 3500
@@ -537,6 +633,14 @@ def main():
     recent_news = state.get("news_titles", [])
 
     arxiv_all = fetch_arxiv(since)
+    if arxiv_all:
+        paper_cache = save_paper_cache(arxiv_all)
+        log("arxiv online ok, pool=%d (cache refreshed)" % len(arxiv_all))
+    else:
+        arxiv_all = load_paper_cache(state)
+        paper_cache = state.get("paper_cache") or save_paper_cache(arxiv_all)
+        log("arxiv online failed, fallback cache pool=%d" % len(arxiv_all))
+
     new_papers = pick_papers(arxiv_all, pushed_ids, PAPER_LIMIT)
 
     news_all = fetch_news()
@@ -547,29 +651,26 @@ def main():
     date_str = today.isoformat()
     if not new_papers and not new_news:
         body = "📡 %s · %s：今日无新增内容" % (BRIEF_TITLE, date_str)
-        log("post: " + post_markdown(body))
+        post_markdown(body)
         save_state({"pushed_paper_ids": pushed_ids[-PAPER_ID_KEEP:],
                     "news_titles": recent_news[-40:],
+                    "paper_cache": paper_cache,
                     "last_run": now_bjt().isoformat()})
         return
 
     enriched = llm_enrich(new_papers, new_news)
-    if enriched:
-        body_mid = enriched
-    else:
-        body_mid = fallback_body(new_papers, new_news)
+    body_mid = enriched if enriched else fallback_body(new_papers, new_news)
     header = "📡 **%s · %s**\n\n" % (BRIEF_TITLE, date_str)
-    notes = ("\n\n> 说明：论文取自 arXiv 近%d天池（每日轮换未推过的，不要求当天新发）；行业资讯来自搜狗微信等检索，覆盖%s。"
-             "摘要为文章开头片段仅供参考。"
+    notes = ("\n\n> 说明：论文取自 arXiv 近%d天池（每日轮换）；资讯覆盖%s。"
              % (PAPER_LOOKBACK_DAYS, NEWS_FOCUS)
              if not LLM_API_KEY else
-             "\n\n> 说明：内容由 LLM 中文提炼；论文取自 arXiv 近%d天池每日轮换，资讯覆盖%s。"
+             "\n\n> 说明：论文链接由本地固定组装；要点由 LLM 中文提炼。论文取自 arXiv 近%d天池；资讯覆盖%s。"
              % (PAPER_LOOKBACK_DAYS, NEWS_FOCUS))
-    content = header + body_mid + notes
-    post_briefing(content)
+    post_briefing(header + body_mid + notes)
 
     save_state({"pushed_paper_ids": update_pushed_ids(pushed_ids, new_papers),
                 "news_titles": (recent_news + [n["title"] for n in new_news])[-40:],
+                "paper_cache": paper_cache,
                 "last_run": now_bjt().isoformat()})
     log("done. papers=%d news=%d llm=%s domain=%s" % (
         len(new_papers), len(new_news), "on" if LLM_API_KEY else "off", DOMAIN))
